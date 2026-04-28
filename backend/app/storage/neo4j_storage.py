@@ -20,6 +20,7 @@ from neo4j.exceptions import (
 )
 
 from ..config import Config
+from ..providers.types import EmbeddingDimensionMismatchError
 from .graph_storage import GraphStorage
 from .embedding_service import EmbeddingService
 from .ner_extractor import NERExtractor
@@ -62,13 +63,67 @@ class Neo4jStorage(GraphStorage):
         self._driver.close()
 
     def _ensure_schema(self):
-        """Create indexes and constraints if they don't exist."""
+        """Create indexes and constraints if they don't exist.
+
+        Vector indexes are sized from the configured embedding dimension.
+        If a vector index already exists with a different dimension we
+        raise `EmbeddingDimensionMismatchError` so the operator knows
+        they need to drop/recreate the index (or change the embedding
+        model) instead of silently producing broken queries.
+        """
+        configured_dim = self._embedding.dimensions
         with self._driver.session() as session:
-            for query in neo4j_schema.ALL_SCHEMA_QUERIES:
+            self._check_vector_index_dimension(
+                session, neo4j_schema.ENTITY_VECTOR_INDEX_NAME, configured_dim
+            )
+            self._check_vector_index_dimension(
+                session, neo4j_schema.RELATION_VECTOR_INDEX_NAME, configured_dim
+            )
+
+            for query in neo4j_schema.build_schema_queries(configured_dim):
                 try:
                     session.run(query)
                 except Exception as e:
                     logger.warning(f"Schema query warning (may already exist): {e}")
+
+    @staticmethod
+    def _check_vector_index_dimension(session, index_name: str, configured: int) -> None:
+        """Raise if an existing vector index disagrees with `configured`."""
+        try:
+            result = session.run(
+                "SHOW INDEXES YIELD name, options "
+                "WHERE name = $name "
+                "RETURN options AS options",
+                name=index_name,
+            )
+            record = result.single()
+        except Exception as e:
+            # Older Neo4j or insufficient privileges; don't block startup.
+            logger.debug("Could not introspect vector index %s: %s", index_name, e)
+            return
+
+        if not record:
+            return  # Index doesn't exist yet — will be created.
+
+        options = record.get("options") or {}
+        index_config = options.get("indexConfig") or {}
+        # Neo4j 5.x reports this key with backticks intact.
+        existing = (
+            index_config.get("vector.dimensions")
+            or index_config.get("`vector.dimensions`")
+        )
+        if existing is None:
+            return
+        try:
+            existing_int = int(existing)
+        except (TypeError, ValueError):
+            return
+        if existing_int != configured:
+            raise EmbeddingDimensionMismatchError(
+                configured=configured,
+                actual=existing_int,
+                source=f"Neo4j index '{index_name}'",
+            )
 
     # ----------------------------------------------------------------
     # Retry wrapper

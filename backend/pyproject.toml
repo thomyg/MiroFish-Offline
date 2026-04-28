@@ -53,3 +53,13 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: fast unit test (no network, no DB)",
+    "integration: integration test (requires services)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

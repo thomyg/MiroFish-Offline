@@ -42,6 +42,38 @@ def create_app(config_class=Config):
     # Enable CORS
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+    # Validate provider config early so misconfiguration shows up at boot.
+    config_errors = Config.validate()
+    if config_errors:
+        for err in config_errors:
+            logger.error("Config error: %s", err)
+
+    # --- Initialize provider singletons (DI via app.extensions) ---
+    from .providers import create_llm_provider, create_embedding_provider
+    try:
+        app.extensions['llm_provider'] = create_llm_provider()
+        if should_log_startup:
+            logger.info(
+                "LLM provider initialized: %s (model=%s)",
+                Config.LLM_PROVIDER, Config.LLM_MODEL_NAME,
+            )
+    except Exception as e:
+        logger.error("LLM provider initialization failed: %s", e)
+        app.extensions['llm_provider'] = None
+
+    try:
+        app.extensions['embedding_provider'] = create_embedding_provider()
+        if should_log_startup:
+            logger.info(
+                "Embedding provider initialized: %s (model=%s, dim=%d)",
+                Config.EMBEDDING_PROVIDER,
+                Config.EMBEDDING_MODEL,
+                Config.EMBEDDING_DIMENSIONS,
+            )
+    except Exception as e:
+        logger.error("Embedding provider initialization failed: %s", e)
+        app.extensions['embedding_provider'] = None
+
     # --- Initialize Neo4jStorage singleton (DI via app.extensions) ---
     from .storage import Neo4jStorage
     try:

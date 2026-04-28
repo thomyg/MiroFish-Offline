@@ -3,12 +3,25 @@
 Thumbs.db
 
 # 环境变量（保护敏感信息）
+# Catch ALL .env variants except the committed example template.
 .env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 .env.development
 .env.test
 .env.production
+
+# Secret / credential files (defense in depth)
+secrets/
+secrets.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+service-account*.json
 
 # Python
 __pycache__/
