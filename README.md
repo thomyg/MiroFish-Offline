@@ -19,15 +19,41 @@
 
 MiroFish is a multi-agent simulation engine: upload any document (press release, policy draft, financial report), and it generates hundreds of AI agents with unique personalities that simulate the public reaction on social media. Posts, arguments, opinion shifts — hour by hour.
 
-The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Chinese market (Chinese UI, Zep Cloud for knowledge graphs, DashScope API). This fork makes it **fully local and fully English**:
+The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Chinese market (Chinese UI, Zep Cloud for knowledge graphs, DashScope API). This fork makes it **fully local, fully English, and provider-pluggable**:
 
 | Original MiroFish | MiroFish-Offline |
 |---|---|
 | Chinese UI | **English UI** (1,000+ strings translated) |
-| Zep Cloud (graph memory) | **Neo4j Community Edition 5.15** |
-| DashScope / OpenAI API (LLM) | **Ollama** (qwen2.5, llama3, etc.) |
-| Zep Cloud embeddings | **nomic-embed-text** via Ollama |
-| Cloud API keys required | **Zero cloud dependencies** |
+| Zep Cloud (graph memory) | **Neo4j Community Edition 5.18** |
+| DashScope / OpenAI API (LLM, hard-coded) | **Pluggable LLM provider** — Ollama / OpenAI / Azure OpenAI / Anthropic-style (MiniMax, Claude, …) |
+| Zep Cloud embeddings (hard-coded) | **Pluggable embedding provider** — Ollama / OpenAI / Azure OpenAI / MiniMax |
+| Cloud API keys required | **Local default, hosted optional** — switch via `.env` |
+
+## Provider support
+
+LLM and embedding traffic flow through a clean abstraction layer
+(`backend/app/providers/`). The application code only sees the
+`LLMProvider` and `EmbeddingProvider` Protocols; switching providers is
+a config change, not a code change.
+
+**LLM providers** (set `LLM_PROVIDER=...`):
+- `openai_compatible` — Ollama, hosted OpenAI, vLLM, LM Studio, any OpenAI-Chat-Completions API
+- `azure_openai` — deployment-scoped URL with `api-key` header
+- `anthropic_style` — real Anthropic, MiniMax, and any provider speaking the Messages API
+
+**Embedding providers** (set `EMBEDDING_PROVIDER=...`):
+- `ollama` (default; `nomic-embed-text`, 768d)
+- `openai_compatible` — hosted OpenAI / OpenAI-shape APIs
+- `azure_openai` — Azure OpenAI embedding deployments
+- `minimax` — MiniMax-native shape (`texts`/`vectors`)
+
+Embedding dimensions are configurable (`EMBEDDING_DIMENSIONS=...`) and
+the Neo4j vector index is built from that value at startup. Mismatch
+against an existing index raises a clear `EmbeddingDimensionMismatchError`.
+
+See [`docs/provider-config.md`](./docs/provider-config.md) for full
+per-provider examples (Ollama, Azure OpenAI, hosted OpenAI, MiniMax,
+real Anthropic) and a Neo4j dimension-migration playbook.
 
 ## Workflow
 
@@ -109,68 +135,94 @@ Open `http://localhost:3000`.
 
 ## Configuration
 
-All settings are in `.env` (copy from `.env.example`):
+All settings live in `.env` (copy from `.env.example`). The default
+config is fully local Ollama. Switching to any other provider is a
+matter of editing a few env vars — no code changes.
 
 ```bash
-# LLM — points to local Ollama (OpenAI-compatible API)
+# LLM — pick a provider, then set its keys
+LLM_PROVIDER=openai_compatible            # or azure_openai | anthropic_style
 LLM_API_KEY=ollama
 LLM_BASE_URL=http://localhost:11434/v1
 LLM_MODEL_NAME=qwen2.5:32b
+
+# Embeddings — pick a provider, then set its keys
+EMBEDDING_PROVIDER=ollama                 # or openai_compatible | azure_openai | minimax
+EMBEDDING_BASE_URL=http://localhost:11434
+EMBEDDING_MODEL_NAME=nomic-embed-text
+EMBEDDING_DIMENSIONS=768                  # MUST match Neo4j vector index
 
 # Neo4j
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=mirofish
-
-# Embeddings
-EMBEDDING_MODEL=nomic-embed-text
-EMBEDDING_BASE_URL=http://localhost:11434
 ```
 
-Works with any OpenAI-compatible API — swap Ollama for Claude, GPT, or any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
+Provider-specific extras (`LLM_DEPLOYMENT_NAME` / `LLM_API_VERSION` for
+Azure, `LLM_ANTHROPIC_VERSION` for Anthropic-style, `EMBEDDING_DEPLOYMENT_NAME`
+for Azure embeddings, etc.) are documented in
+[`docs/provider-config.md`](./docs/provider-config.md).
+
+The legacy `EMBEDDING_MODEL` env var is still accepted as a fallback for
+`EMBEDDING_MODEL_NAME` so existing deployments keep working unchanged.
 
 ## Architecture
 
-This fork introduces a clean abstraction layer between the application and the graph database:
+This fork introduces two clean abstraction layers — one between the
+application and the **graph database**, and one between the application
+and the **LLM / embedding providers**:
 
 ```
-┌─────────────────────────────────────────┐
-│              Flask API                   │
-│  graph.py  simulation.py  report.py     │
-└──────────────┬──────────────────────────┘
-               │ app.extensions['neo4j_storage']
-┌──────────────▼──────────────────────────┐
-│           Service Layer                  │
-│  EntityReader  GraphToolsService         │
-│  GraphMemoryUpdater  ReportAgent         │
-└──────────────┬──────────────────────────┘
-               │ storage: GraphStorage
-┌──────────────▼──────────────────────────┐
-│         GraphStorage (abstract)          │
-│              │                            │
-│    ┌─────────▼─────────┐                │
-│    │   Neo4jStorage     │                │
-│    │  ┌───────────────┐ │                │
-│    │  │ EmbeddingService│ ← Ollama       │
-│    │  │ NERExtractor   │ ← Ollama LLM   │
-│    │  │ SearchService  │ ← Hybrid search │
-│    │  └───────────────┘ │                │
-│    └───────────────────┘                │
-└─────────────────────────────────────────┘
-               │
-        ┌──────▼──────┐
-        │  Neo4j CE   │
-        │  5.15       │
-        └─────────────┘
+┌─────────────────────────────────────────────┐
+│                 Flask API                    │
+│     graph.py  simulation.py  report.py       │
+└──────────┬───────────────────────┬──────────┘
+           │                       │
+           │ app.extensions[       │ app.extensions[
+           │  'neo4j_storage']     │  'llm_provider',
+           │                       │  'embedding_provider']
+┌──────────▼─────────┐   ┌─────────▼──────────────────┐
+│   Service Layer    │   │    Provider Layer          │
+│  EntityReader      │   │  LLMProvider (Protocol)    │
+│  GraphTools        │   │   ├ openai_compatible      │
+│  GraphMemoryUpdater│   │   ├ azure_openai           │
+│  ReportAgent       │   │   └ anthropic_style        │
+│  NERExtractor ─────┼──▶│  EmbeddingProvider (Proto) │
+│  SearchService ────┼──▶│   ├ ollama                 │
+└──────────┬─────────┘   │   ├ openai_compatible      │
+           │             │   ├ azure_openai           │
+           │             │   └ minimax                │
+           │             └────────────────────────────┘
+           │ GraphStorage (abstract)
+┌──────────▼──────────┐
+│    Neo4jStorage     │  vector dim = EMBEDDING_DIMENSIONS
+└──────────┬──────────┘  (validated against existing index)
+           ▼
+     ┌──────────┐
+     │ Neo4j CE │
+     │  5.18    │
+     └──────────┘
 ```
 
 **Key design decisions:**
 
-- `GraphStorage` is an abstract interface — swap Neo4j for any other graph DB by implementing one class
-- Dependency injection via Flask `app.extensions` — no global singletons
-- Hybrid search: 0.7 × vector similarity + 0.3 × BM25 keyword search
-- Synchronous NER/RE extraction via local LLM (replaces Zep's async episodes)
-- All original dataclasses and LLM tools (InsightForge, Panorama, Agent Interviews) preserved
+- **Provider abstraction** — application code calls `llm.generate(...)`
+  and `embeddings.embed(...)` and never knows which backend is active.
+  All wire-format details (Anthropic system-message split, Azure
+  deployment URLs, Ollama `num_ctx`, MiniMax `texts`/`vectors`,
+  `<think>` block stripping) live inside `app/providers/`.
+- **Configurable embedding dimensions** — Neo4j vector index is built
+  from `EMBEDDING_DIMENSIONS`; mismatch against an existing index
+  raises a clear error instead of silently producing broken queries.
+- **GraphStorage** is still an abstract interface — swap Neo4j for any
+  other graph DB by implementing one class.
+- **Dependency injection** via Flask `app.extensions` — no global
+  singletons.
+- **Hybrid search** — 0.7 × vector similarity + 0.3 × BM25 keyword.
+- **Synchronous NER/RE extraction** via the configured LLM provider
+  (replaces Zep's async episodes).
+- All original dataclasses and LLM tools (InsightForge, Panorama,
+  Agent Interviews) preserved.
 
 ## Hardware Requirements
 
